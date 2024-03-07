@@ -47,7 +47,7 @@ __all__ = [
 #     (x, (y + (2*x + 1)) % n),
 #     (x, (y + (2*x + 2)) % n),
 #
-@nx._dispatch(graphs=None)
+@nx._dispatchable(graphs=None, returns_graph=True)
 def margulis_gabber_galil_graph(n, create_using=None):
     r"""Returns the Margulis-Gabber-Galil undirected MultiGraph on `n^2` nodes.
 
@@ -90,7 +90,7 @@ def margulis_gabber_galil_graph(n, create_using=None):
     return G
 
 
-@nx._dispatch(graphs=None)
+@nx._dispatchable(graphs=None, returns_graph=True)
 def chordal_cycle_graph(p, create_using=None):
     """Returns the chordal cycle graph on `p` nodes.
 
@@ -154,7 +154,7 @@ def chordal_cycle_graph(p, create_using=None):
     return G
 
 
-@nx._dispatch(graphs=None)
+@nx._dispatchable(graphs=None, returns_graph=True)
 def paley_graph(p, create_using=None):
     r"""Returns the Paley $\frac{(p-1)}{2}$ -regular graph on $p$ nodes.
 
@@ -214,6 +214,7 @@ def paley_graph(p, create_using=None):
 
 
 @nx.utils.decorators.np_random_state("seed")
+@nx._dispatchable(graphs=None, returns_graph=True)
 def maybe_regular_expander(n, d, *, create_using=None, max_tries=100, seed=None):
     r"""Utility for creating a random regular expander.
 
@@ -248,7 +249,7 @@ def maybe_regular_expander(n, d, *, create_using=None, max_tries=100, seed=None)
 
     Examples
     --------
-    >>> G = nx.maybe_regular_expander(n=200, d=6)
+    >>> G = nx.maybe_regular_expander(n=200, d=6, seed=8020)
 
     Returns
     -------
@@ -307,7 +308,8 @@ def maybe_regular_expander(n, d, *, create_using=None, max_tries=100, seed=None)
             iterations -= 1
             # Faster than random.permutation(n) since there are only
             # (n-1)! distinct cycles against n! permutations of size n
-            cycle = np.concatenate((seed.permutation(n - 1), [n - 1]))
+            cycle = seed.permutation(n - 1).tolist()
+            cycle.append(n - 1)
 
             new_edges = {
                 (u, v)
@@ -330,6 +332,7 @@ def maybe_regular_expander(n, d, *, create_using=None, max_tries=100, seed=None)
 
 @nx.utils.not_implemented_for("directed")
 @nx.utils.not_implemented_for("multigraph")
+@nx._dispatchable(preserve_edge_attrs={"G": {"weight": 1}})
 def is_regular_expander(G, *, epsilon=0):
     r"""Determines whether the graph G is a regular expander. [1]_
 
@@ -340,7 +343,7 @@ def is_regular_expander(G, *, epsilon=0):
     the Alon-Boppana bound and given by
     $\lambda = 2 \sqrt{d - 1} + \epsilon$. [2]_
 
-    In the case where $\epsilon = 0 $ then if the graph successfully passes the test
+    In the case where $\epsilon = 0$ then if the graph successfully passes the test
     it is a Ramanujan graph. [3]_
 
     A Ramanujan graph has spectral gap almost as large as possible, which makes them
@@ -387,8 +390,8 @@ def is_regular_expander(G, *, epsilon=0):
 
     _, d = nx.utils.arbitrary_element(G.degree)
 
-    A = nx.adjacency_matrix(G)
-    lams = eigsh(A.asfptype(), which="LM", k=2, return_eigenvectors=False)
+    A = nx.adjacency_matrix(G, dtype=float)
+    lams = eigsh(A, which="LM", k=2, return_eigenvectors=False)
 
     # lambda2 is the second biggest eigenvalue
     lambda2 = min(lams)
@@ -396,7 +399,11 @@ def is_regular_expander(G, *, epsilon=0):
     return abs(lambda2) < 2 ** np.sqrt(d - 1) + epsilon
 
 
-def random_regular_expander_graph(n, d, *, epsilon=0, create_using=None, max_tries=100):
+@nx.utils.decorators.np_random_state("seed")
+@nx._dispatchable(graphs=None, returns_graph=True)
+def random_regular_expander_graph(
+    n, d, *, epsilon=0, create_using=None, max_tries=100, seed=None
+):
     r"""Returns a random regular expander graph on $n$ nodes with degree $d$.
 
     An expander graph is a sparse graph with strong connectivity properties. [1]_
@@ -404,7 +411,7 @@ def random_regular_expander_graph(n, d, *, epsilon=0, create_using=None, max_tri
     More precisely the returned graph is a $(n, d, \lambda)$-expander with
     $\lambda = 2 \sqrt{d - 1} + \epsilon$, close to the Alon-Boppana bound. [2]_
 
-    In the case where $\epsilon = 0 $ it returns a Ramanujan graph.
+    In the case where $\epsilon = 0$ it returns a Ramanujan graph.
     A Ramanujan graph has spectral gap almost as large as possible,
     which makes them excellent expanders. [3]_
 
@@ -417,6 +424,8 @@ def random_regular_expander_graph(n, d, *, epsilon=0, create_using=None, max_tri
     epsilon : int, float, default=0
     max_tries : int, (default: 100)
       The number of allowed loops, also used in the maybe_regular_expander utility
+    seed : (default: None)
+      Seed used to set random number generation state. See :ref`Randomness<randomness>`.
 
     Raises
     ------
@@ -446,13 +455,15 @@ def random_regular_expander_graph(n, d, *, epsilon=0, create_using=None, max_tri
     .. [3] Ramanujan graphs, https://en.wikipedia.org/wiki/Ramanujan_graph
 
     """
-    G = maybe_regular_expander(n, d, create_using=create_using, max_tries=max_tries)
+    G = maybe_regular_expander(
+        n, d, create_using=create_using, max_tries=max_tries, seed=seed
+    )
     iterations = max_tries
 
     while not is_regular_expander(G, epsilon=epsilon):
         iterations -= 1
         G = maybe_regular_expander(
-            n=n, d=d, create_using=create_using, max_tries=max_tries
+            n=n, d=d, create_using=create_using, max_tries=max_tries, seed=seed
         )
 
         if iterations == 0:

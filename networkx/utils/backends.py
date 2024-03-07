@@ -78,6 +78,17 @@ tests are working, while avoiding causing an explicit failure.
 If a backend only partially implements some algorithms, it can define
 a ``can_run(name, args, kwargs)`` function that returns True or False
 indicating whether it can run the algorithm with the given arguments.
+It may also return a string indicating why the algorithm can't be run;
+this string may be used in the future to give helpful info to the user.
+
+A backend may also define ``should_run(name, args, kwargs)`` that is similar
+to ``can_run``, but answers whether the backend *should* be run (converting
+if necessary). Like ``can_run``, it receives the original arguments so it
+can decide whether it should be run by inspecting the arguments. ``can_run``
+runs before ``should_run``, so ``should_run`` may assume ``can_run`` is True.
+
+If not implemented by the backend, ``can_run`` and ``should_run`` are
+assumed to always return True if the backend implements the algorithm.
 
 A special ``on_start_tests(items)`` function may be defined by the backend.
 It will be called with the list of NetworkX tests discovered. Each item
@@ -86,7 +97,6 @@ the test using `item.add_marker(pytest.mark.xfail(reason=...))`.
 """
 import inspect
 import os
-import sys
 import warnings
 from functools import partial
 from importlib.metadata import entry_points
@@ -94,8 +104,13 @@ from importlib.metadata import entry_points
 import networkx as nx
 
 from ..exception import NetworkXNotImplemented
+from .decorators import argmap
 
-__all__ = ["_dispatch"]
+__all__ = ["_dispatchable"]
+
+
+def _do_nothing():
+    """This does nothing at all, yet it helps turn `_dispatchable` into functions."""
 
 
 def _get_backends(group, *, load_and_call=False):
@@ -124,93 +139,39 @@ def _get_backends(group, *, load_and_call=False):
     return rv
 
 
-# Rename "plugin" to "backend", and give backends a release cycle to update.
-backends = _get_backends("networkx.plugins")
-backend_info = _get_backends("networkx.plugin_info", load_and_call=True)
-
-backends.update(_get_backends("networkx.backends"))
-backend_info.update(_get_backends("networkx.backend_info", load_and_call=True))
+backends = _get_backends("networkx.backends")
+backend_info = _get_backends("networkx.backend_info", load_and_call=True)
 
 # Load and cache backends on-demand
 _loaded_backends = {}  # type: ignore[var-annotated]
+
+
+def _always_run(name, args, kwargs):
+    return True
 
 
 def _load_backend(backend_name):
     if backend_name in _loaded_backends:
         return _loaded_backends[backend_name]
     rv = _loaded_backends[backend_name] = backends[backend_name].load()
+    if not hasattr(rv, "can_run"):
+        rv.can_run = _always_run
+    if not hasattr(rv, "should_run"):
+        rv.should_run = _always_run
     return rv
 
 
 _registered_algorithms = {}
 
 
-class _dispatch:
-    """Dispatches to a backend algorithm based on input graph types.
-
-    Parameters
-    ----------
-    func : function
-
-    name : str, optional
-        The name of the algorithm to use for dispatching. If not provided,
-        the name of ``func`` will be used. ``name`` is useful to avoid name
-        conflicts, as all dispatched algorithms live in a single namespace.
-
-    graphs : str or dict or None, default "G"
-        If a string, the parameter name of the graph, which must be the first
-        argument of the wrapped function. If more than one graph is required
-        for the algorithm (or if the graph is not the first argument), provide
-        a dict of parameter name to argument position for each graph argument.
-        For example, ``@_dispatch(graphs={"G": 0, "auxiliary?": 4})``
-        indicates the 0th parameter ``G`` of the function is a required graph,
-        and the 4th parameter ``auxiliary`` is an optional graph.
-        To indicate an argument is a list of graphs, do e.g. ``"[graphs]"``.
-        Use ``graphs=None`` if *no* arguments are NetworkX graphs such as for
-        graph generators, readers, and conversion functions.
-
-    edge_attrs : str or dict, optional
-        ``edge_attrs`` holds information about edge attribute arguments
-        and default values for those edge attributes.
-        If a string, ``edge_attrs`` holds the function argument name that
-        indicates a single edge attribute to include in the converted graph.
-        The default value for this attribute is 1. To indicate that an argument
-        is a list of attributes (all with default value 1), use e.g. ``"[attrs]"``.
-        If a dict, ``edge_attrs`` holds a dict keyed by argument names, with
-        values that are either the default value or, if a string, the argument
-        name that indicates the default value.
-
-    node_attrs : str or dict, optional
-        Like ``edge_attrs``, but for node attributes.
-
-    preserve_edge_attrs : bool or str or dict, optional
-        For bool, whether to preserve all edge attributes.
-        For str, the parameter name that may indicate (with ``True`` or a
-        callable argument) whether all edge attributes should be preserved
-        when converting.
-        For dict of ``{graph_name: {attr: default}}``, indicate pre-determined
-        edge attributes (and defaults) to preserve for input graphs.
-
-    preserve_node_attrs : bool or str or dict, optional
-        Like ``preserve_edge_attrs``, but for node attributes.
-
-    preserve_graph_attrs : bool or set
-        For bool, whether to preserve all graph attributes.
-        For set, which input graph arguments to preserve graph attributes.
-
-    preserve_all_attrs : bool
-        Whether to preserve all edge, node and graph attributes.
-        This overrides all the other preserve_*_attrs.
-
-    """
-
+class _dispatchable:
     # Allow any of the following decorator forms:
-    #  - @_dispatch
-    #  - @_dispatch()
-    #  - @_dispatch(name="override_name")
-    #  - @_dispatch(graphs="graph")
-    #  - @_dispatch(edge_attrs="weight")
-    #  - @_dispatch(graphs={"G": 0, "H": 1}, edge_attrs={"weight": "default"})
+    #  - @_dispatchable
+    #  - @_dispatchable()
+    #  - @_dispatchable(name="override_name")
+    #  - @_dispatchable(graphs="graph")
+    #  - @_dispatchable(edge_attrs="weight")
+    #  - @_dispatchable(graphs={"G": 0, "H": 1}, edge_attrs={"weight": "default"})
 
     # These class attributes are currently used to allow backends to run networkx tests.
     # For example: `PYTHONPATH=. pytest --backend graphblas --fallback-to-nx`
@@ -237,10 +198,81 @@ class _dispatch:
         preserve_node_attrs=False,
         preserve_graph_attrs=False,
         preserve_all_attrs=False,
+        mutates_input=False,
+        returns_graph=False,
     ):
+        """Dispatches to a backend algorithm based on input graph types.
+
+        Parameters
+        ----------
+        func : function
+
+        name : str, optional
+            The name of the algorithm to use for dispatching. If not provided,
+            the name of ``func`` will be used. ``name`` is useful to avoid name
+            conflicts, as all dispatched algorithms live in a single namespace.
+
+        graphs : str or dict or None, default "G"
+            If a string, the parameter name of the graph, which must be the first
+            argument of the wrapped function. If more than one graph is required
+            for the algorithm (or if the graph is not the first argument), provide
+            a dict of parameter name to argument position for each graph argument.
+            For example, ``@_dispatchable(graphs={"G": 0, "auxiliary?": 4})``
+            indicates the 0th parameter ``G`` of the function is a required graph,
+            and the 4th parameter ``auxiliary`` is an optional graph.
+            To indicate an argument is a list of graphs, do e.g. ``"[graphs]"``.
+            Use ``graphs=None`` if *no* arguments are NetworkX graphs such as for
+            graph generators, readers, and conversion functions.
+
+        edge_attrs : str or dict, optional
+            ``edge_attrs`` holds information about edge attribute arguments
+            and default values for those edge attributes.
+            If a string, ``edge_attrs`` holds the function argument name that
+            indicates a single edge attribute to include in the converted graph.
+            The default value for this attribute is 1. To indicate that an argument
+            is a list of attributes (all with default value 1), use e.g. ``"[attrs]"``.
+            If a dict, ``edge_attrs`` holds a dict keyed by argument names, with
+            values that are either the default value or, if a string, the argument
+            name that indicates the default value.
+
+        node_attrs : str or dict, optional
+            Like ``edge_attrs``, but for node attributes.
+
+        preserve_edge_attrs : bool or str or dict, optional
+            For bool, whether to preserve all edge attributes.
+            For str, the parameter name that may indicate (with ``True`` or a
+            callable argument) whether all edge attributes should be preserved
+            when converting.
+            For dict of ``{graph_name: {attr: default}}``, indicate pre-determined
+            edge attributes (and defaults) to preserve for input graphs.
+
+        preserve_node_attrs : bool or str or dict, optional
+            Like ``preserve_edge_attrs``, but for node attributes.
+
+        preserve_graph_attrs : bool or set
+            For bool, whether to preserve all graph attributes.
+            For set, which input graph arguments to preserve graph attributes.
+
+        preserve_all_attrs : bool
+            Whether to preserve all edge, node and graph attributes.
+            This overrides all the other preserve_*_attrs.
+
+        mutates_input : bool or dict, default False
+            For bool, whether the functions mutates an input graph argument.
+            For dict of ``{arg_name: arg_pos}``, arguments that indicates whether an
+            input graph will be mutated, and ``arg_name`` may begin with ``"not "``
+            to negate the logic (for example, this is used by ``copy=`` arguments).
+            By default, dispatching doesn't convert input graphs to a different
+            backend for functions that mutate input graphs.
+
+        returns_graph : bool, default False
+            Whether the function can return or yield a graph object. By default,
+            dispatching doesn't convert input graphs to a different backend for
+            functions that return graphs.
+        """
         if func is None:
             return partial(
-                _dispatch,
+                _dispatchable,
                 name=name,
                 graphs=graphs,
                 edge_attrs=edge_attrs,
@@ -249,6 +281,8 @@ class _dispatch:
                 preserve_node_attrs=preserve_node_attrs,
                 preserve_graph_attrs=preserve_graph_attrs,
                 preserve_all_attrs=preserve_all_attrs,
+                mutates_input=mutates_input,
+                returns_graph=returns_graph,
             )
         if isinstance(func, str):
             raise TypeError("'name' and 'graphs' must be passed by keyword") from None
@@ -284,6 +318,9 @@ class _dispatch:
         self.preserve_edge_attrs = preserve_edge_attrs or preserve_all_attrs
         self.preserve_node_attrs = preserve_node_attrs or preserve_all_attrs
         self.preserve_graph_attrs = preserve_graph_attrs or preserve_all_attrs
+        self.mutates_input = mutates_input
+        # Keep `returns_graph` private for now, b/c we may extend info on return types
+        self._returns_graph = returns_graph
 
         if edge_attrs is not None and not isinstance(edge_attrs, str | dict):
             raise TypeError(
@@ -307,6 +344,16 @@ class _dispatch:
             raise TypeError(
                 f"Bad type for preserve_graph_attrs: {type(self.preserve_graph_attrs)}."
                 " Expected bool or set."
+            ) from None
+        if not isinstance(self.mutates_input, bool | dict):
+            raise TypeError(
+                f"Bad type for mutates_input: {type(self.mutates_input)}."
+                " Expected bool or dict."
+            ) from None
+        if not isinstance(self._returns_graph, bool):
+            raise TypeError(
+                f"Bad type for returns_graph: {type(self._returns_graph)}."
+                " Expected bool."
             ) from None
 
         if isinstance(graphs, str):
@@ -353,6 +400,11 @@ class _dispatch:
             raise KeyError(
                 f"Algorithm already exists in dispatch registry: {name}"
             ) from None
+        # Use the magic of `argmap` to turn `self` into a function. This does result
+        # in small additional overhead compared to calling `_dispatchable` directly,
+        # but `argmap` has the magical property that it can stack with other `argmap`
+        # decorators "for free". Being a function is better for REPRs and type-checkers.
+        self = argmap(_do_nothing)(self)
         _registered_algorithms[name] = self
         return self
 
@@ -441,15 +493,6 @@ class _dispatch:
         #     if (val := args[pos] if pos < len(args) else kwargs.get(gname)) is not None
         # }
 
-        if self._is_testing and self._automatic_backends and backend_name is None:
-            # Special path if we are running networkx tests with a backend.
-            return self._convert_and_call_for_tests(
-                self._automatic_backends[0],
-                args,
-                kwargs,
-                fallback_to_nx=self._fallback_to_nx,
-            )
-
         # Check if any graph comes from a backend
         if self.list_graphs:
             # Make sure we don't lose values by consuming an iterator
@@ -463,48 +506,42 @@ class _dispatch:
                     args[self.graphs[gname]] = val
 
             has_backends = any(
-                hasattr(g, "__networkx_backend__") or hasattr(g, "__networkx_plugin__")
+                hasattr(g, "__networkx_backend__")
                 if gname not in self.list_graphs
-                else any(
-                    hasattr(g2, "__networkx_backend__")
-                    or hasattr(g2, "__networkx_plugin__")
-                    for g2 in g
-                )
+                else any(hasattr(g2, "__networkx_backend__") for g2 in g)
                 for gname, g in graphs_resolved.items()
             )
             if has_backends:
                 graph_backend_names = {
-                    getattr(
-                        g,
-                        "__networkx_backend__",
-                        getattr(g, "__networkx_plugin__", "networkx"),
-                    )
+                    getattr(g, "__networkx_backend__", "networkx")
                     for gname, g in graphs_resolved.items()
                     if gname not in self.list_graphs
                 }
                 for gname in self.list_graphs & graphs_resolved.keys():
                     graph_backend_names.update(
-                        getattr(
-                            g,
-                            "__networkx_backend__",
-                            getattr(g, "__networkx_plugin__", "networkx"),
-                        )
+                        getattr(g, "__networkx_backend__", "networkx")
                         for g in graphs_resolved[gname]
                     )
         else:
             has_backends = any(
-                hasattr(g, "__networkx_backend__") or hasattr(g, "__networkx_plugin__")
-                for g in graphs_resolved.values()
+                hasattr(g, "__networkx_backend__") for g in graphs_resolved.values()
             )
             if has_backends:
                 graph_backend_names = {
-                    getattr(
-                        g,
-                        "__networkx_backend__",
-                        getattr(g, "__networkx_plugin__", "networkx"),
-                    )
+                    getattr(g, "__networkx_backend__", "networkx")
                     for g in graphs_resolved.values()
                 }
+
+        if self._is_testing and self._automatic_backends and backend_name is None:
+            # Special path if we are running networkx tests with a backend.
+            # This even runs for (and handles) functions that mutate input graphs.
+            return self._convert_and_call_for_tests(
+                self._automatic_backends[0],
+                args,
+                kwargs,
+                fallback_to_nx=self._fallback_to_nx,
+            )
+
         if has_backends:
             # Dispatchable graphs found! Dispatch to backend function.
             # We don't handle calls with different backend graphs yet,
@@ -537,7 +574,8 @@ class _dispatch:
             backend = _load_backend(graph_backend_name)
             if hasattr(backend, self.name):
                 if "networkx" in graph_backend_names:
-                    # We need to convert networkx graphs to backend graphs
+                    # We need to convert networkx graphs to backend graphs.
+                    # There is currently no need to check `self.mutates_input` here.
                     return self._convert_and_call(
                         graph_backend_name,
                         args,
@@ -558,10 +596,34 @@ class _dispatch:
             )
 
         # Only networkx graphs; try to convert and run with a backend with automatic
-        # conversion, but don't do this by default for graph generators or loaders.
-        if self.graphs:
+        # conversion, but don't do this by default for graph generators or loaders,
+        # or if the functions mutates an input graph or returns a graph.
+        # Only convert and run if `backend.should_run(...)` returns True.
+        if (
+            not self._returns_graph
+            and (
+                not self.mutates_input
+                or isinstance(self.mutates_input, dict)
+                # If `mutates_input` begins with "not ", then assume the argument is boolean,
+                # otherwise treat it as a node or edge attribute if it's not None.
+                and any(
+                    not (
+                        args[arg_pos]
+                        if len(args) > arg_pos
+                        else kwargs.get(arg_name[4:], True)
+                    )
+                    if arg_name.startswith("not ")
+                    else (
+                        args[arg_pos] if len(args) > arg_pos else kwargs.get(arg_name)
+                    )
+                    is not None
+                    for arg_name, arg_pos in self.mutates_input.items()
+                )
+            )
+        ):
+            # Should we warn or log if we don't convert b/c the input will be mutated?
             for backend_name in self._automatic_backends:
-                if self._can_backend_run(backend_name, *args, **kwargs):
+                if self._should_backend_run(backend_name, *args, **kwargs):
                     return self._convert_and_call(
                         backend_name,
                         args,
@@ -572,10 +634,27 @@ class _dispatch:
         return self.orig_func(*args, **kwargs)
 
     def _can_backend_run(self, backend_name, /, *args, **kwargs):
-        """Can the specified backend run this algorithms with these arguments?"""
+        """Can the specified backend run this algorithm with these arguments?"""
         backend = _load_backend(backend_name)
-        return hasattr(backend, self.name) and (
-            not hasattr(backend, "can_run") or backend.can_run(self.name, args, kwargs)
+        # `backend.can_run` and `backend.should_run` may return strings that describe
+        # why they can't or shouldn't be run. We plan to use the strings in the future.
+        return (
+            hasattr(backend, self.name)
+            and (can_run := backend.can_run(self.name, args, kwargs))
+            and not isinstance(can_run, str)
+        )
+
+    def _should_backend_run(self, backend_name, /, *args, **kwargs):
+        """Can/should the specified backend run this algorithm with these arguments?"""
+        backend = _load_backend(backend_name)
+        # `backend.can_run` and `backend.should_run` may return strings that describe
+        # why they can't or shouldn't be run. We plan to use the strings in the future.
+        return (
+            hasattr(backend, self.name)
+            and (can_run := backend.can_run(self.name, args, kwargs))
+            and not isinstance(can_run, str)
+            and (should_run := backend.should_run(self.name, args, kwargs))
+            and not isinstance(should_run, str)
         )
 
     def _convert_arguments(self, backend_name, args, kwargs):
@@ -740,12 +819,7 @@ class _dispatch:
                         name=self.name,
                         graph_name=gname,
                     )
-                    if getattr(
-                        g,
-                        "__networkx_backend__",
-                        getattr(g, "__networkx_plugin__", "networkx"),
-                    )
-                    == "networkx"
+                    if getattr(g, "__networkx_backend__", "networkx") == "networkx"
                     else g
                     for g in bound.arguments[gname]
                 ]
@@ -773,14 +847,7 @@ class _dispatch:
                     preserve_graph = gname in preserve_graph_attrs
                 else:
                     preserve_graph = preserve_graph_attrs
-                if (
-                    getattr(
-                        graph,
-                        "__networkx_backend__",
-                        getattr(graph, "__networkx_plugin__", "networkx"),
-                    )
-                    == "networkx"
-                ):
+                if getattr(graph, "__networkx_backend__", "networkx") == "networkx":
                     bound.arguments[gname] = backend.convert_from_nx(
                         graph,
                         edge_attrs=edges,
@@ -834,11 +901,15 @@ class _dispatch:
                 msg += " with the given arguments"
             pytest.xfail(msg)
 
-        from collections.abc import Iterator
+        from collections.abc import Iterable, Iterator, Mapping
         from copy import copy
         from io import BufferedReader, BytesIO
         from itertools import tee
         from random import Random
+
+        import numpy as np
+        from numpy.random import Generator, RandomState
+        from scipy.sparse import sparray
 
         # We sometimes compare the backend result to the original result,
         # so we need two sets of arguments. We tee iterators and copy
@@ -849,7 +920,7 @@ class _dispatch:
             args1, args2 = zip(
                 *(
                     (arg, copy(arg))
-                    if isinstance(arg, Random | BytesIO)
+                    if isinstance(arg, BytesIO | Random | Generator | RandomState)
                     else tee(arg)
                     if isinstance(arg, Iterator) and not isinstance(arg, BufferedReader)
                     else (arg, arg)
@@ -862,7 +933,7 @@ class _dispatch:
             kwargs1, kwargs2 = zip(
                 *(
                     ((k, v), (k, copy(v)))
-                    if isinstance(v, Random | BytesIO)
+                    if isinstance(v, BytesIO | Random | Generator | RandomState)
                     else ((k, (teed := tee(v))[0]), (k, teed[1]))
                     if isinstance(v, Iterator) and not isinstance(v, BufferedReader)
                     else ((k, v), (k, v))
@@ -884,6 +955,84 @@ class _dispatch:
             pytest.xfail(
                 exc.args[0] if exc.args else f"{self.name} raised {type(exc).__name__}"
             )
+        # Verify that `self._returns_graph` is correct. This compares the return type
+        # to the type expected from `self._returns_graph`. This handles tuple and list
+        # return types, but *does not* catch functions that yield graphs.
+        if (
+            self._returns_graph
+            != (
+                isinstance(result, nx.Graph)
+                or hasattr(result, "__networkx_backend__")
+                or isinstance(result, tuple | list)
+                and any(
+                    isinstance(x, nx.Graph) or hasattr(x, "__networkx_backend__")
+                    for x in result
+                )
+            )
+            and not (
+                # May return Graph or None
+                self.name in {"check_planarity", "check_planarity_recursive"}
+                and any(x is None for x in result)
+            )
+            and not (
+                # May return Graph or dict
+                self.name in {"held_karp_ascent"}
+                and any(isinstance(x, dict) for x in result)
+            )
+            and self.name
+            not in {
+                # yields graphs
+                "all_triads",
+                "general_k_edge_subgraphs",
+                # yields graphs or arrays
+                "nonisomorphic_trees",
+            }
+        ):
+            raise RuntimeError(f"`returns_graph` is incorrect for {self.name}")
+
+        def check_result(val, depth=0):
+            if isinstance(val, np.number):
+                raise RuntimeError(
+                    f"{self.name} returned a numpy scalar {val} ({type(val)}, depth={depth})"
+                )
+            if isinstance(val, np.ndarray | sparray):
+                return
+            if isinstance(val, nx.Graph):
+                check_result(val._node, depth=depth + 1)
+                check_result(val._adj, depth=depth + 1)
+                return
+            if isinstance(val, Iterator):
+                raise NotImplementedError
+            if isinstance(val, Iterable) and not isinstance(val, str):
+                for x in val:
+                    check_result(x, depth=depth + 1)
+            if isinstance(val, Mapping):
+                for x in val.values():
+                    check_result(x, depth=depth + 1)
+
+        def check_iterator(it):
+            for val in it:
+                try:
+                    check_result(val)
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"{self.name} returned a numpy scalar {val} ({type(val)})"
+                    ) from exc
+                yield val
+
+        if self.name in {"from_edgelist"}:
+            # numpy scalars are explicitly given as values in some tests
+            pass
+        elif isinstance(result, Iterator):
+            result = check_iterator(result)
+        else:
+            try:
+                check_result(result)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{self.name} returned a numpy scalar {result} ({type(result)})"
+                ) from exc
+            check_result(result)
 
         if self.name in {
             "edmonds_karp_core",
@@ -994,25 +1143,36 @@ class _dispatch:
                 continue
 
             func_info = info["functions"][self.name]
-            if "extra_docstring" in func_info:
+
+            # Renaming extra_docstring to additional_docs
+            if func_docs := (
+                func_info.get("additional_docs") or func_info.get("extra_docstring")
+            ):
                 lines.extend(
-                    f"  {line}" if line else line
-                    for line in func_info["extra_docstring"].split("\n")
+                    f"  {line}" if line else line for line in func_docs.split("\n")
                 )
                 add_gap = True
             else:
                 add_gap = False
-            if "extra_parameters" in func_info:
+
+            # Renaming extra_parameters to additional_parameters
+            if extra_parameters := (
+                func_info.get("extra_parameters")
+                or func_info.get("additional_parameters")
+            ):
                 if add_gap:
                     lines.append("")
-                lines.append("  Extra parameters:")
-                extra_parameters = func_info["extra_parameters"]
+                lines.append("  Additional parameters:")
                 for param in sorted(extra_parameters):
                     lines.append(f"    {param}")
                     if desc := extra_parameters[param]:
                         lines.append(f"      {desc}")
                     lines.append("")
             else:
+                lines.append("")
+
+            if func_url := func_info.get("url"):
+                lines.append(f"[`Source <{func_url}>`_]")
                 lines.append("")
 
         lines.pop()  # Remove last empty line
@@ -1024,10 +1184,10 @@ class _dispatch:
 
         This uses the global registry `_registered_algorithms` to deserialize.
         """
-        return _restore_dispatch, (self.name,)
+        return _restore_dispatchable, (self.name,)
 
 
-def _restore_dispatch(name):
+def _restore_dispatchable(name):
     return _registered_algorithms[name]
 
 
@@ -1037,11 +1197,17 @@ if os.environ.get("_NETWORKX_BUILDING_DOCS_"):
     # This doesn't show e.g. `*, backend=None, **backend_kwargs` in the
     # signatures, which is probably okay. It does allow the docstring to be
     # updated based on the installed backends.
-    _orig_dispatch = _dispatch
+    _orig_dispatchable = _dispatchable
 
-    def _dispatch(func=None, **kwargs):  # type: ignore[no-redef]
+    def _dispatchable(func=None, **kwargs):  # type: ignore[no-redef]
         if func is None:
-            return partial(_dispatch, **kwargs)
-        dispatched_func = _orig_dispatch(func, **kwargs)
+            return partial(_dispatchable, **kwargs)
+        dispatched_func = _orig_dispatchable(func, **kwargs)
         func.__doc__ = dispatched_func.__doc__
         return func
+
+    _dispatchable.__doc__ = _orig_dispatchable.__new__.__doc__  # type: ignore[method-assign,assignment]
+    _sig = inspect.signature(_orig_dispatchable.__new__)
+    _dispatchable.__signature__ = _sig.replace(  # type: ignore[method-assign,assignment]
+        parameters=[v for k, v in _sig.parameters.items() if k != "cls"]
+    )
